@@ -1,0 +1,124 @@
+name: Build & Release
+
+# Build the standalone app + installer on a clean Windows runner.
+#  * Run manually (workflow_dispatch) to produce a downloadable artifact.
+#  * Push a version tag (e.g. v1.0.0) to also publish a GitHub Release.
+#
+# The build is public and reproducible: each release ships a SHA-256 checksum,
+# a build-provenance attestation, and (if VT_API_KEY is set) a VirusTotal scan.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write          # create the Release on a tag push
+  id-token: write          # sign the build-provenance attestation
+  attestations: write      # store the attestation
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      # Optional: add a repo secret named VT_API_KEY to enable the VirusTotal
+      # scan step below. Empty (unset) -> that step is skipped, build still runs.
+      VT_API_KEY: ${{ secrets.VT_API_KEY }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build standalone exe (PyInstaller)
+        run: python -m PyInstaller --noconfirm --clean WhatsThatSignature.spec
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Compile installer (Inno Setup)
+        run: '& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer\WhatsThatSignature.iss'
+
+      - name: Upload installer artifact
+        id: upload
+        uses: actions/upload-artifact@v5
+        with:
+          name: WhatsThatSignature-Setup
+          path: installer/Output/*.exe
+          if-no-files-found: error
+
+      - name: Extract changelog for this tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $out = @(); $inSection = $false
+          foreach ($line in Get-Content CHANGELOG.md) {
+            if ($line -match "^##\s+$([regex]::Escape($tag))(\s|$)") { $inSection = $true; continue }
+            elseif ($inSection -and $line -match "^##\s+") { break }
+            elseif ($inSection) { $out += $line }
+          }
+          $body = ($out -join "`n").Trim()
+          if (-not $body) { $body = "See the commit history for changes in $tag." }
+          $body | Out-File -FilePath release_notes.md -Encoding utf8
+          Write-Host "Release notes:`n$body"
+
+      # VirusTotal is skipped automatically unless a VT_API_KEY repo secret is
+      # set. It runs before the release so its scan link can go into the notes
+      # (the action's own update_release_body only fires on 'release' events,
+      # not tag pushes).
+      - name: Scan with VirusTotal
+        id: vt
+        if: startsWith(github.ref, 'refs/tags/') && env.VT_API_KEY != ''
+        uses: crazy-max/ghaction-virustotal@v4
+        with:
+          vt_api_key: ${{ env.VT_API_KEY }}
+          files: installer/Output/*.exe
+
+      - name: Add VirusTotal link to release notes
+        if: startsWith(github.ref, 'refs/tags/') && steps.vt.outputs.analysis != ''
+        run: |
+          $url = ("${{ steps.vt.outputs.analysis }}" -split '=', 2)[1]
+          "`n[VirusTotal scan]($url)" | Add-Content -Path release_notes.md -Encoding utf8
+
+      - name: Generate SHA-256 checksum
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          $exe = Get-ChildItem installer/Output/*.exe | Select-Object -First 1
+          $hash = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
+          "$hash  $($exe.Name)" | Out-File installer/Output/SHA256SUMS.txt -Encoding ascii
+          Write-Host "$hash  $($exe.Name)"
+
+      # Also attach a zipped copy of the installer.
+      - name: Zip installer
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          $exe = Get-ChildItem installer/Output/*.exe | Select-Object -First 1
+          Compress-Archive -Path $exe.FullName -DestinationPath "installer/Output/$($exe.BaseName).zip" -Force
+          Write-Host "Zipped $($exe.Name)"
+
+      - name: Attest build provenance
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: installer/Output/*.exe
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            installer/Output/*.zip
+            installer/Output/SHA256SUMS.txt
+          body_path: release_notes.md

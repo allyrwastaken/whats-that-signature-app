@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+config.json
+CLAUDE.md
+_test_*.png
+_probe*.png
+_last_capture.png
+_icocheck.png
+_gen_test.py
+overlay.log
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+installer/Output/
